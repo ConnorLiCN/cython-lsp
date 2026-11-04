@@ -3,6 +3,14 @@
 ; them to keywords.  This file is only used when Helix looks up queries by
 ; language name; when it uses the grammar name, Python queries apply directly.
 
+; `from ... cimport ...` is invalid Python, so tree-sitter wraps the line in
+; an ERROR node and the imported module/names fall back to @variable.
+; Highlight identifiers in that error like Python import names.
+((ERROR
+  (identifier) @namespace) @_cimport_error
+  (#match? @_cimport_error "cimport")
+  (#not-any-of? @namespace "cimport" "from"))
+
 ((identifier) @keyword
   (#any-of? @keyword
     "cdef" "cpdef" "cimport" "ctypedef" "nogil" "gil" "prange" "fused"
