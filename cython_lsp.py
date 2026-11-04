@@ -147,6 +147,46 @@ CYTHON_EXTRA_DOCS = {
     "int64_t": "Standard integer type from ``libc.stdint``.",
 }
 
+# Members of the compile-time ``cython`` pseudo-module, offered after
+# ``cython.``.  They cannot be discovered from a .pxd because this namespace
+# is provided by the Cython compiler itself.
+CYTHON_MODULE_MEMBERS = {
+    "sizeof": ("function", "Compile-time C ``sizeof`` of a type or variable."),
+    "cast": ("function", "Cast a value to a C type: ``cython.cast(type, value)``."),
+    "address": ("function", "Take the address of a C value."),
+    "byref": ("function", "Pass a value as a C++ reference."),
+    "pointer": ("function", "Cython pointer helper."),
+    "deref": ("function", "Dereference a C pointer."),
+    "declare": ("function", "Declare C variables/types using Python-like syntax."),
+    "NULL": ("variable", "The C ``NULL`` pointer constant."),
+    "char": ("type", "C ``char`` type."),
+    "short": ("type", "C ``short`` type."),
+    "int": ("type", "C ``int`` type."),
+    "long": ("type", "C ``long`` type."),
+    "float": ("type", "C ``float`` type."),
+    "double": ("type", "C ``double`` type."),
+    "complex": ("type", "C ``complex`` type."),
+    "bint": ("type", "Cython's C boolean type."),
+    "object": ("type", "Python object type."),
+    "str": ("type", "Python string type."),
+    "bytes": ("type", "Python bytes type."),
+    "void": ("type", "C ``void`` type."),
+    "parallel": ("module", "``cython.parallel`` module."),
+    "view": ("module", "``cython.view`` module."),
+    "operator": ("module", "``cython.operator`` module."),
+    "boundscheck": ("variable", "Compile-time bounds checking directive."),
+    "wraparound": ("variable", "Compile-time wraparound directive."),
+    "nonecheck": ("variable", "Compile-time ``None`` checking directive."),
+    "cdivision": ("variable", "Compile-time C division directive."),
+    "overflowcheck": ("variable", "Compile-time overflow checking directive."),
+    "initializedcheck": ("variable", "Compile-time memoryview initialization directive."),
+    "profile": ("variable", "Compile-time profiling directive."),
+    "linetrace": ("variable", "Compile-time line tracing directive."),
+    "embedsignature": ("variable", "Compile-time signature embedding directive."),
+    "binding": ("variable", "Compile-time function binding directive."),
+    "language_level": ("variable", "Compile-time Python language level directive."),
+}
+
 COMMON_MODULES = [
     "os",
     "sys",
@@ -726,6 +766,47 @@ def _module_exports(module: str) -> list:
     return exports
 
 
+_MODULE_MEMBERS_CACHE = {}
+
+
+def _include_submodules(package: str) -> list:
+    includes = _cython_includes_dir()
+    directory = os.path.join(includes, package)
+    try:
+        entries = sorted(os.listdir(directory))
+    except OSError:
+        return []
+    return [
+        entry[:-4]
+        for entry in entries
+        if entry.endswith(".pxd") and entry != "__init__.pxd"
+    ]
+
+
+def _module_members(module: str) -> list:
+    if module in _MODULE_MEMBERS_CACHE:
+        return _MODULE_MEMBERS_CACHE[module]
+
+    members = []
+    if module == "cython":
+        for name, (kind, doc) in CYTHON_MODULE_MEMBERS.items():
+            members.append(
+                {"name": name, "kind": kind, "detail": "cython", "doc": doc}
+            )
+    elif module in ("libc", "libcpp"):
+        for name in _include_submodules(module):
+            members.append(
+                {
+                    "name": name,
+                    "kind": "module",
+                    "detail": module,
+                    "doc": "Cython module ``%s.%s``." % (module, name),
+                }
+            )
+    _MODULE_MEMBERS_CACHE[module] = members
+    return members
+
+
 def _matching_modules(prefix: str, modules: list) -> list:
     """Return modules that start with what the user already typed.
 
@@ -827,6 +908,29 @@ def build_completion_items(text: str, offset: int) -> list:
                     )
                     for export in selected
                 ]
+
+    match = re.search(
+        r"([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\.([A-Za-z_]\w*)?$", before_cursor
+    )
+    if match:
+        module = match.group(1)
+        prefix = match.group(2) or ""
+        members = _module_members(module)
+        if members:
+            edit_range = _range_between(text, offset - len(prefix), offset)
+            lowered = prefix.lower()
+            return [
+                completion_item(
+                    member["name"],
+                    KIND_TO_COMPLETION.get(member["kind"], COMPLETION_TEXT),
+                    member["detail"],
+                    member["doc"],
+                    "0" + member["name"].lower(),
+                    text_edit={"range": edit_range, "newText": member["name"]},
+                )
+                for member in members
+                if not lowered or member["name"].lower().startswith(lowered)
+            ]
 
     items = []
     seen = set()

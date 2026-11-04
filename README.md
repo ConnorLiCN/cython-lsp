@@ -8,6 +8,7 @@
 ~/.local/share/cython-lsp/
 ├── bin/cython-lsp      # Helix 调用的启动器
 ├── cython_lsp.py       # 服务端实现
+├── queries/cython/     # 高亮查询源（复制到 ~/.config/helix/runtime/queries/cython/）
 └── README.md
 ```
 
@@ -29,7 +30,8 @@ language-servers = ["cython-lsp"]
 
 高亮使用 Helix 内置的 Python tree-sitter 语法（`grammar = "python"`），
 并通过 `~/.config/helix/runtime/queries/cython/*.scm` 继承 Python 查询、
-额外把 `cdef`、`cpdef`、`cimport` 等 Cython 关键字高亮为关键字。
+把 `cdef`、`cpdef`、`cimport` 等 Cython 关键字以及 `char`、`double`、
+`size_t` 等 C 类型高亮为对应类别。
 
 ## 功能
 
