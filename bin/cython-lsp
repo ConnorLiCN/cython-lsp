@@ -1,0 +1,5 @@
+#!/bin/sh
+# Launcher for cython-lsp.  The real implementation lives one directory up.
+set -eu
+here=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+exec "${CYTHON_LSP_PYTHON:-python3}" "$here/cython_lsp.py" "$@"
