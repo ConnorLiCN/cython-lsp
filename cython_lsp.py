@@ -661,6 +661,10 @@ _PXD_EXPORTS = {}
 _PXD_DECL_RE = re.compile(
     r"^(?P<ret>(?:[A-Za-z_]\w*\s+|\*+\s*)+)(?P<name>[A-Za-z_]\w*)\s*\("
 )
+_PXD_BARE_FUNC_RE = re.compile(
+    r"^(?P<name>[A-Za-z_]\w*)\s*\([^)]*\)"
+    r"\s*(?:nogil|noexcept|except[^:]*)?\s*:?\s*$"
+)
 _PXD_VAR_RE = re.compile(
     r"^(?:[A-Za-z_]\w*(?:\s+|\s*\*+\s*))+([A-Za-z_]\w*)\s*$"
 )
@@ -854,6 +858,16 @@ def _parse_pxd_exports(path: str) -> list:
             continue
 
         match = _PXD_DECL_RE.match(declaration)
+        if match:
+            name = match.group("name")
+            _add_pxd_export(
+                exports, seen, name, "function", stripped, doc, index, line.find(name)
+            )
+            continue
+
+        # Cython declarations may omit the return type, e.g.
+        # `cpdef sieve(int n)` in a .pxd file.
+        match = _PXD_BARE_FUNC_RE.match(declaration)
         if match:
             name = match.group("name")
             _add_pxd_export(
