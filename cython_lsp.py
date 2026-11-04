@@ -15,6 +15,7 @@ package.  Nothing outside the standard library is imported.
 from __future__ import annotations
 
 import argparse
+import ast
 import asyncio
 import builtins
 import json
@@ -601,6 +602,17 @@ def word_at(text: str, offset: int) -> tuple:
     return line, start, end, line[start:end]
 
 
+def _attribute_at(text: str, offset: int) -> tuple:
+    line_start = text.rfind("\n", 0, offset) + 1
+    before_cursor = text[line_start:offset]
+    match = re.search(
+        r"([A-Za-z_]\w*)\.([A-Za-z_]\w*)?$", before_cursor
+    )
+    if match and match.group(2):
+        return match.group(1), match.group(2)
+    return "", ""
+
+
 def builtin_documentation(name: str) -> str:
     try:
         value = getattr(builtins, name)
@@ -648,6 +660,9 @@ _PXD_EXPORTS = {}
 
 _PXD_DECL_RE = re.compile(
     r"^(?P<ret>(?:[A-Za-z_]\w*\s+|\*+\s*)+)(?P<name>[A-Za-z_]\w*)\s*\("
+)
+_PXD_VAR_RE = re.compile(
+    r"^(?:[A-Za-z_]\w*(?:\s+|\s*\*+\s*))+([A-Za-z_]\w*)\s*$"
 )
 _PXD_ENUM_RE = re.compile(r"^enum\s*:\s*(?P<name>[A-Za-z_]\w*)")
 _PXD_TYPEDEF_RE = re.compile(
@@ -700,54 +715,595 @@ def _cython_includes_dir() -> str:
     return found
 
 
-def _add_pxd_export(exports: list, seen: set, name: str, kind: str, signature: str) -> None:
+def _add_pxd_export(
+    exports: list,
+    seen: set,
+    name: str,
+    kind: str,
+    signature: str,
+    doc: str = "",
+    line: int = -1,
+    character: int = 0,
+) -> None:
     if not name or name in seen or name in _PXD_SKIP or name in _PXD_TYPE_WORDS:
         return
     seen.add(name)
     if signature.endswith((",", "(")):
         signature += " ..."
-    exports.append({"name": name, "kind": kind, "signature": signature[:200]})
+    exports.append(
+        {
+            "name": name,
+            "kind": kind,
+            "signature": signature[:300],
+            "doc": (doc or "").strip(),
+            "line": line,
+            "character": character,
+        }
+    )
 
 
 def _parse_pxd_exports(path: str) -> list:
     exports = []
     seen = set()
     try:
-        handle = open(path, "r", encoding="utf-8", errors="replace")
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            lines = handle.read().splitlines()
     except OSError:
         return exports
 
-    with handle:
-        for raw_line in handle:
-            line = raw_line.split("#", 1)[0].rstrip()
-            stripped = line.strip()
-            if not stripped:
-                continue
-            first = stripped.split(None, 1)[0]
+    pending_comments = []
+    class_indent = None
+    for index, raw_line in enumerate(lines):
+        if not raw_line.strip():
+            pending_comments = []
+            continue
+        if raw_line.lstrip().startswith("#"):
+            pending_comments.append(raw_line.lstrip().lstrip("#").strip())
+            continue
 
-            if first == "ctypedef":
-                match = _PXD_TYPEDEF_RE.match(stripped) or _PXD_ALIAS_RE.match(stripped)
-                if match:
-                    _add_pxd_export(
-                        exports, seen, match.group("name"), "type", stripped
-                    )
+        line = raw_line.split("#", 1)[0].rstrip()
+        stripped = line.strip()
+        if not stripped:
+            continue
+        indent = len(line) - len(line.lstrip(" \t"))
+        if class_indent is not None:
+            if indent <= class_indent:
+                class_indent = None
+            else:
+                pending_comments = []
                 continue
-            if first in _PXD_SKIP:
-                continue
+        inline_comment = ""
+        if "#" in raw_line:
+            inline_comment = raw_line.split("#", 1)[1].strip()
+        doc = "\n".join(pending_comments).strip()
+        if not doc:
+            doc = inline_comment
+        pending_comments = []
 
-            match = _PXD_ENUM_RE.match(stripped)
-            if match:
+        declaration = stripped
+        first = declaration.split(None, 1)[0]
+        if first in ("cdef", "cpdef"):
+            rest = declaration[len(first) :].strip()
+            if rest.startswith("extern"):
+                continue
+            class_match = re.match(r"class\s+([A-Za-z_]\w*)", rest)
+            if class_match:
+                name = class_match.group(1)
                 _add_pxd_export(
-                    exports, seen, match.group("name"), "variable", stripped
+                    exports,
+                    seen,
+                    name,
+                    "class",
+                    stripped,
+                    doc,
+                    index,
+                    line.find(name),
+                )
+                class_indent = indent
+                continue
+            struct_match = re.match(
+                r"(?:struct|union|enum)\s+([A-Za-z_]\w*)", rest
+            )
+            if struct_match:
+                name = struct_match.group(1)
+                _add_pxd_export(
+                    exports,
+                    seen,
+                    name,
+                    "type",
+                    stripped,
+                    doc,
+                    index,
+                    line.find(name),
                 )
                 continue
+            rest = re.sub(
+                r"^(?:public|readonly|api|inline|packed|extern)\s+",
+                "",
+                rest,
+            )
+            if not rest:
+                continue
+            declaration = rest
+            first = declaration.split(None, 1)[0]
 
-            match = _PXD_DECL_RE.match(stripped)
+        if first == "ctypedef":
+            match = _PXD_TYPEDEF_RE.match(stripped) or _PXD_ALIAS_RE.match(stripped)
             if match:
+                name = match.group("name")
                 _add_pxd_export(
-                    exports, seen, match.group("name"), "function", stripped
+                    exports,
+                    seen,
+                    name,
+                    "type",
+                    stripped,
+                    doc,
+                    index,
+                    line.find(name),
                 )
+            continue
+        if first in _PXD_SKIP:
+            continue
+
+        match = _PXD_ENUM_RE.match(declaration)
+        if match:
+            name = match.group("name")
+            _add_pxd_export(
+                exports, seen, name, "variable", stripped, doc, index, line.find(name)
+            )
+            continue
+
+        match = _PXD_DECL_RE.match(declaration)
+        if match:
+            name = match.group("name")
+            _add_pxd_export(
+                exports, seen, name, "function", stripped, doc, index, line.find(name)
+            )
+            continue
+
+        no_initializer = declaration.split("=", 1)[0].rstrip()
+        match = _PXD_VAR_RE.match(no_initializer)
+        if match and indent == 0:
+            name = match.group(1)
+            _add_pxd_export(
+                exports, seen, name, "variable", stripped, doc, index, line.find(name)
+            )
     return exports
+
+
+_PXD_FILE_CACHE = {}
+_STUB_FILE_CACHE = {}
+_LOCAL_MODULE_CACHE = {}
+
+
+def _parse_pxd_cached(path: str) -> list:
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return []
+    cached = _PXD_FILE_CACHE.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+    exports = _parse_pxd_exports(path)
+    _PXD_FILE_CACHE[path] = (mtime, exports)
+    return exports
+
+
+def _search_roots(document_path: str, root_path: str) -> list:
+    roots = []
+
+    def add(path: str) -> None:
+        if not path:
+            return
+        absolute = os.path.abspath(path)
+        if os.path.isdir(absolute) and absolute not in roots:
+            roots.append(absolute)
+
+    add(root_path)
+    if document_path:
+        add(os.path.dirname(os.path.abspath(document_path)))
+    add(os.getcwd())
+    return roots
+
+
+def _resolve_module_file(
+    module: str, document_path: str, root_path: str, extensions: list
+) -> str:
+    module = (module or "").strip()
+    if not module:
+        return ""
+
+    roots = _search_roots(document_path, root_path)
+    if module.startswith("."):
+        base = (
+            os.path.dirname(os.path.abspath(document_path))
+            if document_path
+            else os.getcwd()
+        )
+        roots = [base] + [root for root in roots if root != base]
+        parts = [part for part in module.lstrip(".").split(".") if part]
+    else:
+        parts = [part for part in module.split(".") if part]
+
+    for root in roots:
+        if not parts:
+            for extension in extensions:
+                candidate = os.path.join(root, "__init__" + extension)
+                if os.path.isfile(candidate):
+                    return candidate
+            continue
+        for extension in extensions:
+            candidate = os.path.join(root, *parts) + extension
+            if os.path.isfile(candidate):
+                return candidate
+            candidate = os.path.join(root, *parts, "__init__" + extension)
+            if os.path.isfile(candidate):
+                return candidate
+    return ""
+
+
+def _resolve_python_module(module: str, document_path: str, root_path: str) -> str:
+    path = _resolve_module_file(module, document_path, root_path, [".pyi"])
+    if path:
+        return path
+    path = _resolve_module_file(module, document_path, root_path, [".py"])
+    if path:
+        return path
+
+    if module.startswith(".") or "." in module:
+        return ""
+    try:
+        import importlib.util
+
+        spec = importlib.util.find_spec(module)
+    except Exception:
+        return ""
+    if spec is None:
+        return ""
+    origin = spec.origin or ""
+    if origin.endswith(".py"):
+        stub = origin[:-3] + ".pyi"
+        return stub if os.path.isfile(stub) else origin
+    if origin.endswith(".pyi"):
+        return origin
+    return ""
+
+
+def _local_modules(document_path: str, root_path: str, extensions: list) -> list:
+    roots = _search_roots(document_path, root_path)
+    key = (tuple(roots), tuple(extensions))
+    now = time.time()
+    cached = _LOCAL_MODULE_CACHE.get(key)
+    if cached and now - cached[0] < 3.0:
+        return cached[1]
+
+    skipped = {
+        "__pycache__", "build", "dist", ".git", ".hg", ".svn",
+        ".venv", "venv", "env", "node_modules", ".mypy_cache", ".tox",
+    }
+    found = set()
+    for root in roots:
+        for dirpath, dirnames, filenames in os.walk(root):
+            relative_dir = os.path.relpath(dirpath, root)
+            depth = 0 if relative_dir == "." else relative_dir.count(os.sep) + 1
+            if depth >= 3:
+                dirnames[:] = []
+            dirnames[:] = [
+                name
+                for name in dirnames
+                if not name.startswith(".") and name not in skipped
+            ]
+            for filename in filenames:
+                for extension in extensions:
+                    if not filename.endswith(extension):
+                        continue
+                    relative = os.path.relpath(
+                        os.path.join(dirpath, filename), root
+                    )
+                    module = relative[: -len(extension)].replace(os.sep, ".")
+                    if module.endswith(".__init__"):
+                        module = module[: -len(".__init__")]
+                    if module and not module.startswith("__"):
+                        found.add(module)
+                    break
+            if len(found) >= 500:
+                break
+
+    result = sorted(found)
+    _LOCAL_MODULE_CACHE[key] = (now, result)
+    return result
+
+
+def _import_bindings(text: str) -> dict:
+    bindings = {}
+    for raw_line in text.splitlines():
+        code = raw_line.split("#", 1)[0].strip()
+        if not code:
+            continue
+
+        match = re.match(r"^from\s+([.\w]+)\s+(c?import)\s+(.+)$", code)
+        if match:
+            module = match.group(1)
+            is_cimport = match.group(2) == "cimport"
+            names = match.group(3).strip().strip("()")
+            for part in names.split(","):
+                name, alias = _split_alias(part.strip().strip("()"))
+                if name and name != "*":
+                    bindings[alias or name] = {
+                        "module": module,
+                        "name": name,
+                        "cimport": is_cimport,
+                    }
+            continue
+
+        match = re.match(r"^(c?import)\s+(.+)$", code)
+        if match:
+            is_cimport = match.group(1) == "cimport"
+            names = match.group(2).strip().strip("()")
+            for part in names.split(","):
+                name, alias = _split_alias(part.strip().strip("()"))
+                if not name:
+                    continue
+                bound = alias or name.split(".")[0]
+                bindings[bound] = {
+                    "module": name,
+                    "name": None,
+                    "cimport": is_cimport,
+                }
+    return bindings
+
+
+def _module_comment(lines: list) -> str:
+    comments = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            comments.append(stripped.lstrip("#").strip())
+        elif stripped:
+            break
+    return "\n".join(comments).strip()
+
+
+def _leading_comment(lines: list, lineno: int) -> str:
+    comments = []
+    index = lineno - 2
+    while index >= 0:
+        stripped = lines[index].strip()
+        if stripped.startswith("@"):
+            index -= 1
+            continue
+        if stripped.startswith("#"):
+            comments.append(stripped.lstrip("#").strip())
+            index -= 1
+            continue
+        break
+    return "\n".join(reversed(comments)).strip()
+
+
+def _inline_comment(line: str) -> str:
+    if "#" not in line:
+        return ""
+    return line.split("#", 1)[1].strip()
+
+
+def _stub_signature(lines: list, lineno: int) -> str:
+    parts = []
+    depth = 0
+    for index in range(lineno - 1, min(len(lines), lineno + 20)):
+        stripped = lines[index].strip()
+        if not stripped and parts:
+            break
+        parts.append(stripped)
+        depth += stripped.count("(") + stripped.count("[") + stripped.count("{")
+        depth -= stripped.count(")") + stripped.count("]") + stripped.count("}")
+        if depth <= 0 and (
+            stripped.endswith(":") or stripped.endswith("...") or stripped == "..."
+        ):
+            break
+    signature = " ".join(parts)
+    signature = re.sub(r":\s*(?:\.\.\.|pass)?\s*$", "", signature).strip()
+    return signature[:300]
+
+
+def _parse_stub(path: str) -> dict:
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return {"path": path, "doc": "", "symbols": {}}
+    cached = _STUB_FILE_CACHE.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as handle:
+            source = handle.read()
+    except OSError:
+        return {"path": path, "doc": "", "symbols": {}}
+
+    data = {"path": path, "doc": "", "symbols": {}}
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        _STUB_FILE_CACHE[path] = (mtime, data)
+        return data
+
+    lines = source.splitlines()
+    data["doc"] = ast.get_docstring(tree) or _module_comment(lines)
+
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            name = node.name
+            kind = "class" if isinstance(node, ast.ClassDef) else "function"
+            line_text = lines[node.lineno - 1] if node.lineno <= len(lines) else ""
+            doc = ast.get_docstring(node) or _leading_comment(lines, node.lineno)
+            data["symbols"][name] = {
+                "name": name,
+                "kind": kind,
+                "signature": _stub_signature(lines, node.lineno),
+                "doc": (doc or "").strip(),
+                "line": node.lineno - 1,
+                "character": line_text.find(name),
+                "path": path,
+            }
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            line_text = lines[node.lineno - 1] if node.lineno <= len(lines) else ""
+            doc = _leading_comment(lines, node.lineno) or _inline_comment(line_text)
+            for target in targets:
+                if not isinstance(target, ast.Name):
+                    continue
+                name = target.id
+                if name.startswith("__"):
+                    continue
+                data["symbols"][name] = {
+                    "name": name,
+                    "kind": "variable",
+                    "signature": line_text.strip(),
+                    "doc": (doc or "").strip(),
+                    "line": node.lineno - 1,
+                    "character": line_text.find(name),
+                    "path": path,
+                }
+
+    _STUB_FILE_CACHE[path] = (mtime, data)
+    return data
+
+
+def _lookup_module_symbol(
+    module: str,
+    name,
+    is_cimport: bool,
+    document_path: str,
+    root_path: str,
+):
+    if is_cimport:
+        path = _cimport_path(module, document_path, root_path)
+        if not path:
+            return None
+        exports = _parse_pxd_cached(path)
+        if name is None:
+            return {"path": path, "symbol": None, "module": module, "source": "pxd"}
+        for export in exports:
+            if export["name"] == name:
+                return {
+                    "path": path,
+                    "symbol": export,
+                    "module": module,
+                    "source": "pxd",
+                }
+        return None
+
+    path = _resolve_python_module(module, document_path, root_path)
+    if not path:
+        # ``import module`` can still refer to a compiled Cython extension
+        # whose public declarations live in a .pxd file.
+        return _lookup_module_symbol(
+            module, name, True, document_path, root_path
+        )
+    data = _parse_stub(path)
+    if name is None:
+        return {
+            "path": path,
+            "symbol": None,
+            "module": module,
+            "module_doc": data["doc"],
+            "source": "python",
+        }
+    symbol = data["symbols"].get(name)
+    if symbol is None:
+        return None
+    return {
+        "path": path,
+        "symbol": symbol,
+        "module": module,
+        "source": "python",
+    }
+
+
+def _resolve_imported_symbol(
+    word: str,
+    text: str,
+    document_path: str,
+    root_path: str,
+    alias: str = "",
+):
+    bindings = _import_bindings(text)
+    if alias:
+        entry = bindings.get(alias)
+        if not entry:
+            return None
+        return _lookup_module_symbol(
+            entry["module"], word, entry["cimport"], document_path, root_path
+        )
+
+    entry = bindings.get(word)
+    if not entry:
+        return None
+    return _lookup_module_symbol(
+        entry["module"], entry["name"], entry["cimport"], document_path, root_path
+    )
+
+
+def _resolved_display_path(path: str, root_path: str) -> str:
+    if not path:
+        return ""
+    if root_path:
+        try:
+            relative = os.path.relpath(path, root_path)
+            if not relative.startswith(".."):
+                return relative
+        except ValueError:
+            pass
+    return path
+
+
+def _resolved_markdown(result: dict, root_path: str = "") -> str:
+    symbol = result.get("symbol")
+    path = result.get("path", "")
+    display_path = _resolved_display_path(path, root_path)
+    if symbol is None:
+        value = result.get("module_doc") or "Module documentation."
+        if display_path:
+            value += "\n\n`%s`" % display_path
+        return value
+
+    language = "cython" if result.get("source") == "pxd" else "python"
+    parts = []
+    signature = symbol.get("signature", "")
+    if signature:
+        parts.append("```%s\n%s\n```" % (language, signature))
+    doc = symbol.get("doc", "")
+    if doc:
+        parts.append(doc)
+    location = display_path
+    line = symbol.get("line", -1)
+    if location and line is not None and line >= 0:
+        location += ":%d" % (line + 1)
+    if location:
+        parts.append("`%s`" % location)
+    return "\n\n".join(parts) if parts else "No documentation."
+
+
+def _resolved_location(result: dict):
+    path = result.get("path", "")
+    if not path:
+        return None
+    symbol = result.get("symbol")
+    if symbol is None:
+        line = 0
+        character = 0
+        name = ""
+    else:
+        line = max(0, int(symbol.get("line", 0)))
+        character = max(0, int(symbol.get("character", 0)))
+        name = symbol.get("name", "")
+    return {
+        "uri": path_to_uri(path),
+        "range": {
+            "start": {"line": line, "character": character},
+            "end": {"line": line, "character": character + len(name)},
+        },
+    }
 
 
 def _module_exports(module: str) -> list:
@@ -764,6 +1320,25 @@ def _module_exports(module: str) -> list:
             exports = _parse_pxd_exports(pxd_path)
     _PXD_EXPORTS[module] = exports
     return exports
+
+
+def _cimport_path(module: str, document_path: str, root_path: str) -> str:
+    path = _resolve_module_file(module, document_path, root_path, [".pxd"])
+    if path:
+        return path
+    includes = _cython_includes_dir()
+    if includes:
+        candidate = os.path.join(includes, module.replace(".", os.sep) + ".pxd")
+        if os.path.isfile(candidate):
+            return candidate
+    return ""
+
+
+def _module_exports_for(module: str, document_path: str, root_path: str) -> list:
+    path = _cimport_path(module, document_path, root_path)
+    if path:
+        return _parse_pxd_cached(path)
+    return _module_exports(module)
 
 
 _MODULE_MEMBERS_CACHE = {}
@@ -783,28 +1358,110 @@ def _include_submodules(package: str) -> list:
     ]
 
 
-def _module_members(module: str) -> list:
-    if module in _MODULE_MEMBERS_CACHE:
-        return _MODULE_MEMBERS_CACHE[module]
+def _members_for_module(
+    module: str, is_cimport: bool, document_path: str, root_path: str
+) -> list:
+    if is_cimport:
+        path = _cimport_path(module, document_path, root_path)
+        exports = _parse_pxd_cached(path) if path else []
+        if not exports:
+            return []
+        return [
+            {
+                "name": export["name"],
+                "kind": export["kind"],
+                "detail": "from " + module,
+                "doc": export.get("doc")
+                or "```cython\n%s\n```" % export.get("signature", ""),
+                "signature": export.get("signature", ""),
+                "path": path,
+                "line": export.get("line", 0),
+                "character": export.get("character", 0),
+            }
+            for export in exports
+        ]
 
-    members = []
-    if module == "cython":
-        for name, (kind, doc) in CYTHON_MODULE_MEMBERS.items():
-            members.append(
-                {"name": name, "kind": kind, "detail": "cython", "doc": doc}
-            )
-    elif module in ("libc", "libcpp"):
-        for name in _include_submodules(module):
-            members.append(
-                {
-                    "name": name,
-                    "kind": "module",
-                    "detail": module,
-                    "doc": "Cython module ``%s.%s``." % (module, name),
-                }
-            )
-    _MODULE_MEMBERS_CACHE[module] = members
-    return members
+    path = _resolve_python_module(module, document_path, root_path)
+    if not path:
+        return _members_for_module(module, True, document_path, root_path)
+    data = _parse_stub(path)
+    return [
+        {
+            "name": symbol["name"],
+            "kind": symbol["kind"],
+            "detail": "from " + module,
+            "doc": symbol.get("doc")
+            or "```python\n%s\n```" % symbol.get("signature", ""),
+            "signature": symbol.get("signature", ""),
+            "path": path,
+            "line": symbol.get("line", 0),
+            "character": symbol.get("character", 0),
+        }
+        for symbol in data["symbols"].values()
+    ]
+
+
+def _module_members(
+    module: str, document_path: str = "", root_path: str = ""
+) -> list:
+    if module in ("cython", "libc", "libcpp"):
+        if module in _MODULE_MEMBERS_CACHE:
+            return _MODULE_MEMBERS_CACHE[module]
+        members = []
+        if module == "cython":
+            for name, (kind, doc) in CYTHON_MODULE_MEMBERS.items():
+                members.append(
+                    {"name": name, "kind": kind, "detail": "cython", "doc": doc}
+                )
+        else:
+            for name in _include_submodules(module):
+                members.append(
+                    {
+                        "name": name,
+                        "kind": "module",
+                        "detail": module,
+                        "doc": "Cython module ``%s.%s``." % (module, name),
+                    }
+                )
+        _MODULE_MEMBERS_CACHE[module] = members
+        return members
+
+    pxd_path = _cimport_path(module, document_path, root_path)
+    if pxd_path:
+        return [
+            {
+                "name": export["name"],
+                "kind": export["kind"],
+                "detail": "from " + module,
+                "doc": export.get("doc")
+                or "```cython\n%s\n```" % export.get("signature", ""),
+                "signature": export.get("signature", ""),
+                "path": pxd_path,
+                "line": export.get("line", 0),
+                "character": export.get("character", 0),
+            }
+            for export in _parse_pxd_cached(pxd_path)
+        ]
+
+    python_path = _resolve_python_module(module, document_path, root_path)
+    if python_path:
+        data = _parse_stub(python_path)
+        return [
+            {
+                "name": symbol["name"],
+                "kind": symbol["kind"],
+                "detail": "from " + module,
+                "doc": symbol.get("doc")
+                or "```python\n%s\n```" % symbol.get("signature", ""),
+                "signature": symbol.get("signature", ""),
+                "path": python_path,
+                "line": symbol.get("line", 0),
+                "character": symbol.get("character", 0),
+            }
+            for symbol in data["symbols"].values()
+        ]
+
+    return []
 
 
 def _matching_modules(prefix: str, modules: list) -> list:
@@ -826,9 +1483,13 @@ def _matching_modules(prefix: str, modules: list) -> list:
     return result
 
 
-def build_completion_items(text: str, offset: int) -> list:
+def build_completion_items(
+    text: str, offset: int, document_path: str = "", root_path: str = ""
+) -> list:
     line_start = text.rfind("\n", 0, offset) + 1
     before_cursor = text[line_start:offset]
+    local_pxd = _local_modules(document_path, root_path, [".pxd"])
+    local_python = _local_modules(document_path, root_path, [".pyi", ".py"])
 
     match = re.match(r"^\s*cimport\s+([\w\.]*)$", before_cursor)
     if match:
@@ -842,7 +1503,9 @@ def build_completion_items(text: str, offset: int) -> list:
                 "0" + module.lower(),
                 text_edit={"range": edit_range, "newText": module},
             )
-            for module in _matching_modules(match.group(1), COMMON_CIMPORTS)
+            for module in _matching_modules(
+                match.group(1), COMMON_CIMPORTS + local_pxd
+            )
         ]
 
     match = re.match(r"^\s*import\s+([\w\.]*)$", before_cursor)
@@ -857,13 +1520,18 @@ def build_completion_items(text: str, offset: int) -> list:
                 "0" + module.lower(),
                 text_edit={"range": edit_range, "newText": module},
             )
-            for module in _matching_modules(match.group(1), COMMON_MODULES)
+            for module in _matching_modules(
+                match.group(1), COMMON_MODULES + local_python
+            )
         ]
 
     match = re.match(r"^\s*from\s+([\w\.]*)$", before_cursor)
     if match:
         prefix = match.group(1)
-        modules = _matching_modules(prefix, COMMON_MODULES + COMMON_CIMPORTS)
+        modules = _matching_modules(
+            prefix,
+            COMMON_MODULES + COMMON_CIMPORTS + local_python + local_pxd,
+        )
         edit_range = _range_between(text, line_start + match.start(1), offset)
         return [
             completion_item(
@@ -877,10 +1545,10 @@ def build_completion_items(text: str, offset: int) -> list:
             for module in modules
         ]
 
-    match = re.match(r"^\s*from\s+([\w\.]+)\s+c?import\s+(.*)$", before_cursor)
+    match = re.match(r"^\s*from\s+([\w\.]+)\s+cimport\s+(.*)$", before_cursor)
     if match:
         module = match.group(1)
-        exports = _module_exports(module)
+        exports = _module_exports_for(module, document_path, root_path)
         if exports:
             names_text = match.group(2)
             comma = names_text.rfind(",")
@@ -902,11 +1570,73 @@ def build_completion_items(text: str, offset: int) -> list:
                             export["kind"], COMPLETION_FUNCTION
                         ),
                         "from " + module,
-                        "```cython\n%s\n```" % export["signature"],
+                        export.get("doc")
+                        or "```cython\n%s\n```" % export.get("signature", ""),
                         "0" + export["name"].lower(),
                         text_edit={"range": edit_range, "newText": export["name"]},
                     )
                     for export in selected
+                ]
+
+    match = re.match(r"^\s*from\s+([\w\.]+)\s+import\s+(.*)$", before_cursor)
+    if match:
+        module = match.group(1)
+        candidates = []
+        language = "python"
+        path = _resolve_python_module(module, document_path, root_path)
+        if path:
+            for symbol in _parse_stub(path)["symbols"].values():
+                candidates.append(
+                    {
+                        "name": symbol["name"],
+                        "kind": symbol["kind"],
+                        "doc": symbol.get("doc", ""),
+                        "signature": symbol.get("signature", ""),
+                    }
+                )
+        if not candidates:
+            language = "cython"
+            for export in _module_exports_for(module, document_path, root_path):
+                candidates.append(
+                    {
+                        "name": export["name"],
+                        "kind": export["kind"],
+                        "doc": export.get("doc", ""),
+                        "signature": export.get("signature", ""),
+                    }
+                )
+
+        if candidates:
+            names_text = match.group(2)
+            comma = names_text.rfind(",")
+            raw_segment = names_text[comma + 1 :]
+            leading = len(raw_segment) - len(raw_segment.lstrip())
+            segment = raw_segment.strip()
+            if not segment or re.fullmatch(r"[A-Za-z_]\w*", segment) is not None:
+                edit_start = line_start + match.start(2) + comma + 1 + leading
+                edit_range = _range_between(text, edit_start, offset)
+                selected = [
+                    candidate
+                    for candidate in candidates
+                    if not segment or candidate["name"].startswith(segment)
+                ]
+                return [
+                    completion_item(
+                        candidate["name"],
+                        KIND_TO_COMPLETION.get(
+                            candidate["kind"], COMPLETION_FUNCTION
+                        ),
+                        "from " + module,
+                        candidate["doc"]
+                        or "```%s\n%s\n```"
+                        % (language, candidate["signature"]),
+                        "0" + candidate["name"].lower(),
+                        text_edit={
+                            "range": edit_range,
+                            "newText": candidate["name"],
+                        },
+                    )
+                    for candidate in selected
                 ]
 
     match = re.search(
@@ -915,7 +1645,23 @@ def build_completion_items(text: str, offset: int) -> list:
     if match:
         module = match.group(1)
         prefix = match.group(2) or ""
-        members = _module_members(module)
+        bindings = _import_bindings(text)
+        entry = bindings.get(module)
+        if module in ("cython", "libc", "libcpp"):
+            members = _module_members(module, document_path, root_path)
+        elif entry and entry.get("name") is None:
+            target = entry["module"]
+            if target in ("cython", "libc", "libcpp"):
+                members = _module_members(target, document_path, root_path)
+            else:
+                members = _members_for_module(
+                    target,
+                    entry["cimport"],
+                    document_path,
+                    root_path,
+                )
+        else:
+            members = _module_members(module, document_path, root_path)
         if members:
             edit_range = _range_between(text, offset - len(prefix), offset)
             lowered = prefix.lower()
@@ -961,11 +1707,27 @@ def build_completion_items(text: str, offset: int) -> list:
         )
 
     for name, detail, kind in collect_imports(text):
+        documentation = "Imported name."
+        resolved = _resolve_imported_symbol(
+            name, text, document_path, root_path
+        )
+        if resolved is not None:
+            symbol = resolved.get("symbol")
+            if symbol is not None:
+                documentation = symbol.get("doc") or (
+                    "```%s\n%s\n```"
+                    % (
+                        "cython" if resolved.get("source") == "pxd" else "python",
+                        symbol.get("signature", ""),
+                    )
+                )
+            else:
+                documentation = resolved.get("module_doc") or documentation
         add(
             name,
             KIND_TO_COMPLETION.get(kind, COMPLETION_MODULE),
             detail,
-            "Imported name.",
+            documentation,
             "1" + name.lower(),
         )
 
@@ -1590,7 +2352,15 @@ class CythonLanguageServer:
             return {"isIncomplete": False, "items": []}
         text = document["text"]
         offset = position_to_offset(text, params.get("position") or {})
-        return {"isIncomplete": False, "items": build_completion_items(text, offset)}
+        return {
+            "isIncomplete": False,
+            "items": build_completion_items(
+                text,
+                offset,
+                document.get("path", ""),
+                self.root_path,
+            ),
+        }
 
     def hover(self, params: dict):
         _, document = self._document(params)
@@ -1601,8 +2371,21 @@ class CythonLanguageServer:
         _, start, end, word = word_at(text, offset)
         if not word:
             return None
+        document_path = document.get("path", "")
 
         value = ""
+        attribute_alias, attribute_member = _attribute_at(text, offset)
+        resolved = None
+        if attribute_alias and attribute_member:
+            resolved = _resolve_imported_symbol(
+                attribute_member,
+                text,
+                document_path,
+                self.root_path,
+                alias=attribute_alias,
+            )
+        if resolved is not None:
+            value = _resolved_markdown(resolved, self.root_path)
         if word in CYTHON_KEYWORD_DOCS:
             value = "**%s** - Cython keyword\n\n%s" % (
                 word,
@@ -1626,6 +2409,12 @@ class CythonLanguageServer:
                 word,
                 CYTHON_EXTRA_DOCS[word],
             )
+        if not value:
+            resolved = _resolve_imported_symbol(
+                word, text, document_path, self.root_path
+            )
+            if resolved is not None:
+                value = _resolved_markdown(resolved, self.root_path)
         if not value and hasattr(builtins, word):
             value = builtin_documentation(word)
         if not value:
@@ -1649,6 +2438,21 @@ class CythonLanguageServer:
         _, _, _, word = word_at(text, offset)
         if not word:
             return None
+        document_path = document.get("path", "")
+
+        attribute_alias, attribute_member = _attribute_at(text, offset)
+        if attribute_alias and attribute_member:
+            resolved = _resolve_imported_symbol(
+                attribute_member,
+                text,
+                document_path,
+                self.root_path,
+                alias=attribute_alias,
+            )
+            location = _resolved_location(resolved) if resolved else None
+            if location:
+                return location
+
         for symbol in collect_symbols(text):
             if symbol["name"] != word:
                 continue
@@ -1661,7 +2465,12 @@ class CythonLanguageServer:
                 "uri": uri,
                 "range": {"start": start, "end": end},
             }
-        return None
+
+        resolved = _resolve_imported_symbol(
+            word, text, document_path, self.root_path
+        )
+        location = _resolved_location(resolved) if resolved else None
+        return location
 
     def document_symbols(self, params: dict) -> list:
         _, document = self._document(params)

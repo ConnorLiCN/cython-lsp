@@ -40,10 +40,19 @@ language-servers = ["cython-lsp"]
   引入的名字、当前文件中的类/函数/方法/变量；在 `cimport ` 后补全常用
   Cython/C 模块。`from libc.string cimport ` 这类位置会从 Cython 自带的
   `.pxd` 中解析 `memset`、`memcpy`、`malloc` 等导出名和签名。
+- 本地模块：`cimport mymod` / `from mymod cimport ...` 会优先在当前文件
+  目录和工作区根目录查找 `mymod.pxd`，补全其中的函数、类型和类；支持
+  `mymod.` 成员补全。
+- Python 存根：`import mod` / `from mod import ...` 会查找项目内或已安装
+  模块的 `.pyi`（没有时回退 `.py`）。hover 和补全会显示存根里的注释和
+  docstring，跳转定义可以直接跳到 `.pyi` 文件。
 - 错误提示：调用真正的 Cython 编译器 `cython -3` 检查当前缓冲区。
   `.pxd` 会通过一个临时 `cimport` 包装模块检查，`.pxi` 通过 `include`
   包装检查，避免直接编译声明文件产生误报。
 - 额外提供 hover、跳转到定义、文档符号（`space` + `s` 等）。
+
+模块解析顺序：当前缓冲区所在目录、工作区根目录、当前工作目录，
+最后才是 Cython 自带的 `Cython/Includes`。
 
 ## 依赖
 
