@@ -16,7 +16,7 @@ Helix 配置位于 `~/.config/helix/languages.toml`：
 
 ```toml
 [language-server.cython-lsp]
-command = "/home/connor/.local/share/cython-lsp/bin/cython-lsp"
+command = "${path}/cython-lsp/bin/cython-lsp"
 timeout = 20
 
 [[language]]
